@@ -1992,3 +1992,4 @@ void UsrAI::processData()
             .arg(priest ? priest->Blood : 0));
     }
 }
+
