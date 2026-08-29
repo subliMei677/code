@@ -61,9 +61,7 @@ static const int BRONZE_FOOD      = 800;   // 升铜器花费
 static const int TOWER_STONE_COST = 150;   // 单座箭塔石料
 static const int VILL_FOOD_COST   = 50;    // 村民花费
 static const int PRE_VILL_TARGET  = 12;    // 升铜器前村民数
-static const int POST_VILL_TARGET = 20;    // 升铜器后~第二波结束 村民数
-static const int LATE_VILL_TARGET = 28;    // 第二波结束后村民数
-static const int LATE_FRAME       = 17500; // 第二波结束判定的固定帧
+static const int POST_VILL_TARGET = 24;    // 升铜器后村民数
 static const int PRE_FARM_MAX     = 4;     // 升铜器前农田上限
 static const int POST_FARM_MAX    = 8;     // 升铜器后农田上限
 static const int TOWER_TARGET     = 3;     // 第一波前箭塔数
@@ -139,21 +137,9 @@ static int s_priestCmdId = -1;             // 上次移动指令id
 static int s_priestMoveKey = -1;           // 上次移动目标块key
 static map<int,int> s_scoutBad;            // 块key -> 拉黑截止帧
 static double s_priestSnapDR = 0, s_priestSnapUR = 0;
-static int s_lastPriestBlood = -1;         // 上一帧祭司血量（掉血检测）
-static int s_priestHurtFrame = -9999;      // 上次掉血帧（判定"正被攻击"）
 static int s_priestSnapFrame = 0;
 static int s_priestSnapKey = -1;
 static int s_priestSkillFrame = -999;      // 上次技能(转换/治疗)指令帧
-
-/* v4.3 问题2：祭司躲塔卡位检测
- * 内核的移动指令不做路径可达性校验（Core_List.cpp:225 只记录目的地就返回
- * 成功），目的地走不到时祭司原地不动且无错误码——因此不能依赖 ins_ret，
- * 必须靠"位移快照"判断是否卡住：
- *   s_shelterTries  连续躲塔失败次数（300帧位移<0.8格算一次失败）
- *   >=3 次后放弃躲塔，降级为"原地转化+向远离敌人方向撤离" */
-static int s_shelterTries = 0;             // 连续躲塔失败次数
-static int s_shelterMoveFrame = -9999;     // 上次躲塔移动下令帧（快照起点）
-static double s_shelterSnapDR = 0, s_shelterSnapUR = 0;  // 快照位置
 
 /*----------------------------------------------------------------------------
  * 军队/箭塔指令冷却
@@ -189,14 +175,6 @@ static void clampDetail(double& x, double& y)
 static bool isBronze(const tagInfo& inf)
 {
     return inf.civilizationStage >= CIVILIZATION_BRONZEAGE;
-}
-
-/* 村民目标三段式：升铜器前12 / 升铜器后20 / 第二波后28 */
-static int villTarget(const tagInfo& inf)
-{
-    if (!isBronze(inf)) return PRE_VILL_TARGET;
-    if (inf.GameFrame < LATE_FRAME) return POST_VILL_TARGET;
-    return LATE_VILL_TARGET;
 }
 
 static int countAnyBuilding(const tagInfo& inf, int type)
@@ -492,48 +470,6 @@ static bool findBuildSpot(const tagInfo& inf, int type,
     return false;
 }
 
-/* v4.3 问题6：箭塔专用选址——在 findBuildSpot 基础上增加塔间距约束：
- * 候选位与所有已有箭塔（含在建）间距 ≥4 格，即塔之间至少隔 2 个空格。
- * 目的：扩大火力覆盖范围；避免第三波投石车一次溅射命中两塔。 */
-static bool findBuildSpotTower(const tagInfo& inf,
-                               int adr, int aur, int& odr, int& our_)
-{
-    const int w = bsize(BUILDING_ARROWTOWER);      // 2x2
-    const double minGap = 4.0 * s_bls;             // 塔间距下限
-    for (int r = 1; r <= 18; ++r) {
-        for (int dx = -r; dx <= r; ++dx) {
-            for (int dy = -r; dy <= r; ++dy) {
-                int mx = abs(dx), my = abs(dy);
-                if ((mx > my ? mx : my) != r) continue;   // 只扫当前环
-                int dr = adr + dx, ur = aur + dy;
-                int key = bkey(dr, ur);
-                if (s_badSpot.count(key)) continue;
-                map<int,int>::const_iterator sk = s_spotSkipUntil.find(key);
-                if (sk != s_spotSkipUntil.end() && inf.GameFrame < sk->second)
-                    continue;
-                if (!areaBuildable(inf, dr, ur, w)) continue;
-                if (!areaFree(inf, dr, ur, w)) continue;
-                /* 塔间距校验：候选塔中心与每座已有箭塔中心距离≥4格 */
-                double cx = blockCenter(dr) + 0.5 * s_bls;   // 2x2塔中心
-                double cy = blockCenter(ur) + 0.5 * s_bls;
-                bool gapOk = true;
-                for (size_t i = 0; i < inf.buildings.size() && gapOk; ++i) {
-                    const tagBuilding& b = inf.buildings[i];
-                    if (b.Type != BUILDING_ARROWTOWER) continue;
-                    double bx = blockCenter(b.BlockDR) + 0.5 * s_bls;
-                    double by = blockCenter(b.BlockUR) + 0.5 * s_bls;
-                    if (dist2(cx, cy, bx, by) < minGap * minGap)
-                        gapOk = false;
-                }
-                if (!gapOk) continue;
-                odr = dr; our_ = ur;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 /*----------------------------------------------------------------------------
  * 村民分工（分阶段配额）
  *   升铜器前：食物 + 木材；石头仅当箭塔缺石时临时征用；不采金
@@ -565,11 +501,9 @@ static char pickRole(const tagInfo& inf)
     stoneNeed -= inf.Stone;
     if (stoneNeed < 0) stoneNeed = 0;
 
-    /* v4.2 问题6：升铜器后安排少部分村民采石（固定1~2人），
-     * 石头花销优先级由科技门控保证：谷仓强化 > 采石科技 */
     int qS = 0;
     if (!bronze && stoneNeed > 0) qS = (stoneNeed > 100) ? 3 : 2;
-    else if (bronze) qS = (stoneNeed > 0 || !s_res[R_STONE].done) ? 2 : 1;
+    else if (bronze && stoneNeed > 0) qS = 2;
     int qG = bronze ? 2 : 0;
     int qW = bronze ? (s_res[R_WOOD].done ? 4 : 6) : 5;
 
@@ -700,93 +634,11 @@ static bool nearestFrontier(const tagInfo& inf, double dr, double ur,
 }
 
 /*----------------------------------------------------------------------------
- * v4.2 辅助：烂尾续建节流 / 在途统计 / 远程资源簇 / 间隔选址
- *--------------------------------------------------------------------------*/
-static map<int,int> s_fixCmdFrame;         // 建筑SN -> 上次续建下令帧
-
-/* 远程资源簇：找距市镇中心>minDist、簇内≥minN个的type资源，返回其块坐标。
- * 用于"资源太远就在资源地建存放建筑"（问题11）。
- * v4.3 问题3：storeType 为待建的存放建筑类型——若该资源簇 8 格内
- * 已有同种存放建筑（含在建），说明此簇已被覆盖，跳过，避免重复修建。 */
-static bool remoteCluster(const tagInfo& inf, int type, int minN,
-                          double minDist, int storeType,
-                          int& adr, int& aur)
-{
-    double tcx = blockCenter(s_tcDR), tcy = blockCenter(s_tcUR);
-    double cl2 = 6.0 * s_bls * (6.0 * s_bls);
-    double near2 = 8.0 * s_bls * (8.0 * s_bls);
-    for (size_t i = 0; i < inf.resources.size(); ++i) {
-        const tagResource& r0 = inf.resources[i];
-        if ((int)r0.Type != type || r0.Cnt <= 0) continue;
-        int cnt = 0;
-        for (size_t j = 0; j < inf.resources.size(); ++j) {
-            const tagResource& r1 = inf.resources[j];
-            if ((int)r1.Type != type || r1.Cnt <= 0) continue;
-            if (dist2(r0.DR, r0.UR, r1.DR, r1.UR) < cl2) ++cnt;
-        }
-        if (cnt < minN) continue;
-        if (dist2(r0.DR, r0.UR, tcx, tcy) < minDist * minDist) continue;
-        /* v4.3：簇中心8格内已有同种存放建筑 -> 该簇已覆盖，跳过 */
-        bool covered = false;
-        for (size_t j = 0; j < inf.buildings.size() && !covered; ++j) {
-            const tagBuilding& b = inf.buildings[j];
-            if ((int)b.Type != storeType) continue;
-            if (dist2(r0.DR, r0.UR, blockCenter(b.BlockDR),
-                      blockCenter(b.BlockUR)) < near2)
-                covered = true;
-        }
-        if (covered) continue;
-        adr = r0.BlockDR; aur = r0.BlockUR;
-        return true;
-    }
-    return false;
-}
-
-/* 螺旋选址 + 与已有建筑保持≥gap间距（资源建筑防扎堆，问题11） */
-static bool findBuildSpotGap(const tagInfo& inf, int type,
-                             int adr, int aur, double gap,
-                             int& odr, int& our_)
-{
-    int w = bsize(type);
-    for (int r = 1; r <= 18; ++r) {
-        for (int dx = -r; dx <= r; ++dx) {
-            for (int dy = -r; dy <= r; ++dy) {
-                int mx = abs(dx), my = abs(dy);
-                if ((mx > my ? mx : my) != r) continue;
-                int dr = adr + dx, ur = aur + dy;
-                int key = bkey(dr, ur);
-                if (s_badSpot.count(key)) continue;
-                map<int,int>::const_iterator sk = s_spotSkipUntil.find(key);
-                if (sk != s_spotSkipUntil.end() && inf.GameFrame < sk->second)
-                    continue;
-                if (!areaBuildable(inf, dr, ur, w)) continue;
-                if (!areaFree(inf, dr, ur, w)) continue;
-                /* 与所有已有建筑中心距≥gap */
-                double cx = blockCenter(dr) + (w - 1) * 0.5 * s_bls;
-                double cy = blockCenter(ur) + (w - 1) * 0.5 * s_bls;
-                bool gapOk = true;
-                for (size_t i = 0; i < inf.buildings.size() && gapOk; ++i) {
-                    const tagBuilding& b = inf.buildings[i];
-                    double bx = blockCenter(b.BlockDR);
-                    double by = blockCenter(b.BlockUR);
-                    if (dist2(cx, cy, bx, by) < gap * gap) gapOk = false;
-                }
-                if (!gapOk) continue;
-                odr = dr; our_ = ur;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/*----------------------------------------------------------------------------
  * 1. 建造管理
- *    优先级：箭塔(第一波前3座) > 房屋(按容量配套) > 兵营 > 市场 > 靶场 >
- *            农田(锚定谷仓) > 远程谷仓/仓库(资源太远时)
+ *    优先级：箭塔(第一波前3座) > 房屋(人口将满) > 市场 > 靶场 >
+ *            农田(食物来源枯竭时) > 兵营(第一波后)
  *    选址：箭塔围绕开局预置箭塔，其余围绕市镇中心；螺旋就近。
  *    失败处理：永久拉黑该坐标，绝不重试同一位置。
- *    烂尾续建：在建建筑长期无建造者 -> 派空闲村民续建（问题8）。
  *--------------------------------------------------------------------------*/
 void UsrAI::manageBuild(const tagInfo& inf)
 {
@@ -823,55 +675,6 @@ void UsrAI::manageBuild(const tagInfo& inf)
         s_pend[k].builderSN = -1;
     }
 
-    /* 1.5) v4.2 烂尾续建（问题8）：在建建筑长期无人建造时，
-     *      派空闲村民对其 HumanAction -> 内核走 CoreEven_FixBuilding
-     *      续建流程（Core.cpp:983）。敌袭赶跑建造者后建筑可续建完成。 */
-    for (size_t i = 0; i < inf.buildings.size(); ++i) {
-        const tagBuilding& b = inf.buildings[i];
-        if (b.Percent >= 100) continue;
-
-        /* 是否已有人在建造 */
-        bool hasWorker = false;
-        for (size_t j = 0; j < inf.farmers.size() && !hasWorker; ++j) {
-            const tagFarmer& f = inf.farmers[j];
-            if (f.FarmerSort != FARMERTYPE_FARMER) continue;
-            if (f.WorkObjectSN == b.SN && f.NowState != HUMAN_STATE_IDLE)
-                hasWorker = true;
-        }
-        for (int k = 0; k < 2 && !hasWorker; ++k) {
-            if (s_pend[k].id < 0 || s_pend[k].type != (int)b.Type) continue;
-            for (size_t j = 0; j < inf.farmers.size(); ++j) {
-                if (inf.farmers[j].SN == s_pend[k].builderSN &&
-                    inf.farmers[j].NowState != HUMAN_STATE_IDLE) {
-                    hasWorker = true;
-                    break;
-                }
-            }
-        }
-        if (hasWorker) continue;
-
-        /* 节流：同一建筑240帧内只下一次续建令 */
-        int lastFix = -9999;
-        map<int,int>::iterator fc = s_fixCmdFrame.find(b.SN);
-        if (fc != s_fixCmdFrame.end()) lastFix = fc->second;
-        if (inf.GameFrame - lastFix < 240) continue;
-
-        const tagFarmer* fb = NULL;
-        double bd2 = 1e18;
-        double bx = blockCenter(b.BlockDR), by = blockCenter(b.BlockUR);
-        for (size_t j = 0; j < inf.farmers.size(); ++j) {
-            const tagFarmer& f = inf.farmers[j];
-            if (f.FarmerSort != FARMERTYPE_FARMER) continue;
-            if (f.NowState != HUMAN_STATE_IDLE) continue;
-            double d = dist2(f.DR, f.UR, bx, by);
-            if (d < bd2) { bd2 = d; fb = &f; }
-        }
-        if (!fb) continue;
-        int id = HumanAction(fb->SN, b.SN);
-        s_fixCmdFrame[b.SN] = inf.GameFrame;
-        noteFarmerCmd(fb->SN, id, b.SN, 'M', inf.GameFrame);
-    }
-
     /* 2) 找空闲槽位 */
     int slot = -1;
     for (int k = 0; k < 2; ++k)
@@ -887,23 +690,15 @@ void UsrAI::manageBuild(const tagInfo& inf)
 
     bool bronze = isBronze(inf);
     int farmMax = bronze ? POST_FARM_MAX : PRE_FARM_MAX;
-    int vTarget = villTarget(inf);          // 三段式目标 12/20/28
+    int villTarget = bronze ? POST_VILL_TARGET : PRE_VILL_TARGET;
 
-    /* v4.3 问题1：房屋按"村民+兵力"总量配套，不超建。
-     * 兵力目标与 manageBuildingActions 保持一致：
-     *   升铜器前 3（1近战+2弓）/ 二波前 12 / 之后 20
-     * 所需房屋 = (村民+兵力)/4 向上取整，例：
-     *   12+3=15 -> 4座(16)；20+12=32 -> 8座；28+20=48 -> 12座 */
-    int aTarget = !bronze ? 3 : (inf.GameFrame < WAVE3_SPAWN ? 12 : 20);
-    int needHome = (vTarget + aTarget + 3) / 4;
-
-    /* v4.3 问题4：农田触发只看"浆果"是否采空（瞪羚留给猎人），
-     * 不再等浆果+瞪羚全部枯竭，避免农田修筑过晚 */
-    int bushLeft = 0;
+    /* 可见食物来源（浆果+羚羊）是否枯竭 -> 触发农田 */
+    int wildFood = 0;
     for (size_t i = 0; i < inf.resources.size(); ++i) {
-        if (inf.resources[i].Type == RESOURCE_BUSH &&
+        int t = inf.resources[i].Type;
+        if ((t == RESOURCE_BUSH || t == RESOURCE_GAZELLE) &&
             inf.resources[i].Cnt > 0)
-            ++bushLeft;
+            ++wildFood;
     }
 
     /* v4.1 建造顺序（内核前置实锤，见 Development.cpp）：
@@ -927,9 +722,9 @@ void UsrAI::manageBuild(const tagInfo& inf)
         else { anchorDR = s_tcDR + 4; anchorUR = s_tcUR + 4; }
     }
     else if (TYPE_OK(BUILDING_HOME) &&
-             countAnyBuilding(inf, BUILDING_HOME) < needHome &&  // 总量封顶
+             villagerCount(inf) + s_villPending < villTarget &&
              inf.Human_Num >= inf.Human_MaxNum - 1 && inf.Wood >= 30) {
-        want = BUILDING_HOME;                             // 人口将满才建房，达量即停
+        want = BUILDING_HOME;                             // 人口将满才建房
     }
     else if (TYPE_OK(BUILDING_ARMYCAMP) &&
              countAnyBuilding(inf, BUILDING_ARMYCAMP) == 0 &&
@@ -950,50 +745,15 @@ void UsrAI::manageBuild(const tagInfo& inf)
     else if (TYPE_OK(BUILDING_FARM) &&
              countAnyBuilding(inf, BUILDING_MARKET) > 0 &&
              countAnyBuilding(inf, BUILDING_FARM) < farmMax &&
-             bushLeft == 0 && inf.Wood >= 75) {
-        /* v4.3 问题4：浆果一采空立即修农田（原等"浆果+瞪羚全光+1200帧"
-         * 导致过晚）；瞪羚保留给猎人，不纳入触发条件 */
-        want = BUILDING_FARM;
-        /* v4.3 问题5：农田锚定谷仓但偏移5格成片布置，不再紧贴谷仓螺旋
-         * 外扩——避免把谷仓四面围死、村民无法进入存食物 */
-        const tagBuilding* gd = nearestBuilding(inf, BUILDING_GRANARY,
-                                                blockCenter(s_tcDR),
-                                                blockCenter(s_tcUR), true);
-        if (gd) { anchorDR = gd->BlockDR + 5; anchorUR = gd->BlockUR + 5; }
-        else    { anchorDR = s_tcDR - 5;      anchorUR = s_tcUR - 5; }
-    }
-    /* 问题11：资源聚集地离基地>10格 -> 就地建存放建筑（谷仓收食物、
-     * 仓库收木材），与已有建筑间距≥3格防扎堆；各至多2座 */
-    else if (TYPE_OK(BUILDING_GRANARY) &&
-             countAnyBuilding(inf, BUILDING_GRANARY) < 2 && inf.Wood >= 100) {
-        int adr, aur;
-        if (remoteCluster(inf, RESOURCE_BUSH, 4, 10.0 * s_bls,
-                          BUILDING_GRANARY, adr, aur)) {
-            want = BUILDING_GRANARY;
-            anchorDR = adr; anchorUR = aur;
-        }
-    }
-    else if (TYPE_OK(BUILDING_STOCK) &&
-             countAnyBuilding(inf, BUILDING_STOCK) < 2 && inf.Wood >= 100) {
-        int adr, aur;
-        if (remoteCluster(inf, RESOURCE_TREE, 8, 12.0 * s_bls,
-                          BUILDING_STOCK, adr, aur)) {
-            want = BUILDING_STOCK;
-            anchorDR = adr; anchorUR = aur;
-        }
+             wildFood <= 1 && inf.Wood >= 75 && inf.GameFrame > 1200) {
+        want = BUILDING_FARM;                             // 野食枯竭才种田
     }
     #undef TYPE_OK
     if (want < 0) return;
 
-    /* 3) 螺旋选址：箭塔用带塔间距版本（问题6），远程存放建筑用
-     *    带建筑间距版本，其余用普通螺旋就近 */
+    /* 3) 螺旋选址 */
     int dr, ur;
-    if (want == BUILDING_ARROWTOWER) {
-        if (!findBuildSpotTower(inf, anchorDR, anchorUR, dr, ur)) return;
-    } else if (want == BUILDING_GRANARY || want == BUILDING_STOCK) {
-        if (!findBuildSpotGap(inf, want, anchorDR, anchorUR,
-                              3.0 * s_bls, dr, ur)) return;
-    } else if (!findBuildSpot(inf, want, anchorDR, anchorUR, dr, ur)) return;
+    if (!findBuildSpot(inf, want, anchorDR, anchorUR, dr, ur)) return;
 
     /* 4) 最近的空闲村民去建造 */
     const tagFarmer* builder = NULL;
@@ -1058,15 +818,7 @@ void UsrAI::manageBuildingActions(const tagInfo& inf)
 
     bool bronze = isBronze(inf);
     bool popOk  = (inf.Human_Num < inf.Human_MaxNum - 0.5);
-    int  vTarget = villTarget(inf);         // 三段式 12/20/28
-
-    /* v4.2 关键修复（问题2）：进入铜器当帧立即复位升级锁。
-     * 原缺陷：s_ageUpgOrdered 置位后不复位，而造村民条件含
-     * !s_ageUpgOrdered，导致升铜器后村民生产永久停止。 */
-    if (bronze && s_ageUpgOrdered) {
-        s_ageUpgOrdered = false;
-        s_ageUpgId = -1;
-    }
+    int  villTarget = bronze ? POST_VILL_TARGET : PRE_VILL_TARGET;
 
     /* 兵力目标与练兵许可（升级前保留800食物基金，仅用富余造少量兵） */
     int meleeTarget, archerTarget;
@@ -1094,10 +846,7 @@ void UsrAI::manageBuildingActions(const tagInfo& inf)
                     BuildingAction(b.SN, BUILDING_GRANARY_ARROWTOWER);
                 s_res[R_TOWER_UNLOCK].frame = inf.GameFrame;
             }
-            /* v4.3 问题6：箭塔强化=铜器后第一优先级（120食+50石）。
-             * 原缺陷：练兵/造村民持续吃食物，与采石科技抢石头，
-             * 120食+50石始终凑不齐。现由练兵/造村民/仓库科技的食物
-             * 门槛保证优先攒足（见下方各分支）。 */
+            /* 箭塔强化：仅铜器 */
             else if (bronze && !s_res[R_TOWER_UPG].done &&
                      s_res[R_TOWER_UPG].id < 0 &&
                      inf.GameFrame >= s_res[R_TOWER_UPG].cdUntil &&
@@ -1108,30 +857,24 @@ void UsrAI::manageBuildingActions(const tagInfo& inf)
             }
         }
         else if (b.Type == BUILDING_MARKET) {
-            /* v4.2 市场科技链（铜器后），花销优先级：
-             *   食物：谷仓强化(120) > 驯养动物(200) > 采石(100)
-             *   低优先级项需"高优先级已完成"或"资源够双份"才放行，
-             *   避免抢占高优先级科技的资源。 */
+            /* 市场科技一律铜器后：木材加工 > 驯养动物 > 石矿 > 金矿 */
             if (bronze && !s_res[R_WOOD].done && s_res[R_WOOD].id < 0 &&
                 inf.GameFrame >= s_res[R_WOOD].cdUntil &&
                 inf.Meat >= 120 && inf.Wood >= 75) {
-                /* 问题2：升铜器后立刻研发伐木科技 */
                 s_res[R_WOOD].id = BuildingAction(b.SN, BUILDING_MARKET_WOOD_UPGRADE);
                 s_res[R_WOOD].frame = inf.GameFrame;
             }
-            else if (bronze && !s_res[R_FARM].done && s_res[R_FARM].id < 0 &&
+            else if (bronze && s_res[R_WOOD].done && !s_res[R_FARM].done &&
+                     s_res[R_FARM].id < 0 &&
                      inf.GameFrame >= s_res[R_FARM].cdUntil &&
-                     countDoneBuilding(inf, BUILDING_FARM) >= 2 &&   // 问题3触发
-                     inf.Meat >= 200 && inf.Wood >= 50 &&
-                     (s_res[R_TOWER_UPG].done || inf.Meat >= 320)) {
+                     inf.Meat >= 200 && inf.Wood >= 50) {
                 s_res[R_FARM].id = BuildingAction(b.SN, BUILDING_MARKET_FARM_UPGRADE);
                 s_res[R_FARM].frame = inf.GameFrame;
             }
-            else if (bronze && !s_res[R_STONE].done && s_res[R_STONE].id < 0 &&
+            else if (bronze && s_res[R_FARM].done && !s_res[R_STONE].done &&
+                     s_res[R_STONE].id < 0 &&
                      inf.GameFrame >= s_res[R_STONE].cdUntil &&
-                     inf.Meat >= 100 && inf.Stone >= 50 &&
-                     (s_res[R_TOWER_UPG].done || inf.Stone >= 100) &&
-                     (s_res[R_FARM].done || inf.Meat >= 300)) {
+                     inf.Meat >= 100 && inf.Stone >= 50) {
                 s_res[R_STONE].id = BuildingAction(b.SN, BUILDING_MARKET_STONE_UPGRADE);
                 s_res[R_STONE].frame = inf.GameFrame;
             }
@@ -1144,10 +887,8 @@ void UsrAI::manageBuildingActions(const tagInfo& inf)
             }
         }
         else if (b.Type == BUILDING_STOCK) {
-            /* 仓库：工具使用（近战攻+2），铜器后；
-             * v4.3 问题6：箭塔强化未完成时让路（防抢100食） */
-            if (bronze && s_res[R_TOWER_UPG].done &&
-                !s_res[R_USETOOL].done && s_res[R_USETOOL].id < 0 &&
+            /* 仓库：工具使用（近战攻+2），铜器后 */
+            if (bronze && !s_res[R_USETOOL].done && s_res[R_USETOOL].id < 0 &&
                 inf.GameFrame >= s_res[R_USETOOL].cdUntil &&
                 inf.Meat >= 100) {
                 s_res[R_USETOOL].id =
@@ -1168,8 +909,8 @@ void UsrAI::manageBuildingActions(const tagInfo& inf)
                 s_lastUpgradeTry = inf.GameFrame;
             }
             else if (popOk && !s_ageUpgOrdered) {
-                /* 造村民：升铜器前12 / 后20 / 二波后28（v4.2 三段式） */
-                if (villagerCount(inf) + s_villPending < vTarget &&
+                /* 造村民：升级前恰好12人，升级后扩到24人 */
+                if (villagerCount(inf) + s_villPending < villTarget &&
                     inf.Meat >= VILL_FOOD_COST) {
                     BuildingAction(b.SN, BUILDING_CENTER_CREATEFARMER);
                     ++s_villPending;
@@ -1186,10 +927,7 @@ void UsrAI::manageBuildingActions(const tagInfo& inf)
             }
             else if (mayTrain && popOk &&
                      inf.GameFrame - s_trainCdFrame >= 90 &&
-                     countMelee(inf) < meleeTarget && inf.Meat >= 50 &&
-                     /* v4.3 问题6：箭塔强化未完成时给其预留食物，
-                      * 余粮不足200(=120强化+50兵+余量)不造兵 */
-                     (s_res[R_TOWER_UPG].done || inf.Meat >= 200)) {
+                     countMelee(inf) < meleeTarget && inf.Meat >= 50) {
                 BuildingAction(b.SN, BUILDING_ARMYCAMP_CREATE_CLUBMAN);
                 s_trainCdFrame = inf.GameFrame;
             }
@@ -1198,9 +936,7 @@ void UsrAI::manageBuildingActions(const tagInfo& inf)
             if (mayTrain && popOk &&
                 inf.GameFrame - s_trainCdFrame >= 90 &&
                 countArchers(inf) < archerTarget &&
-                inf.Meat >= 40 && inf.Wood >= 20 &&
-                /* v4.3 问题6：同兵营，箭塔强化未完成时预留食物 */
-                (s_res[R_TOWER_UPG].done || inf.Meat >= 200)) {
+                inf.Meat >= 40 && inf.Wood >= 20) {
                 BuildingAction(b.SN, BUILDING_RANGE_CREATE_BOWMAN);
                 s_trainCdFrame = inf.GameFrame;
             }
@@ -1215,16 +951,6 @@ void UsrAI::manageFarmers(const tagInfo& inf)
 {
     bool bronze = isBronze(inf);
     double fleeR = 5.0 * s_bls;
-
-    /* v4.2 问题7：一人一田。先统计"有资源但0人采集"的农田，
-     * 主循环里空闲村民优先补派到这些田（不会多派：上限1由
-     * nearestFoodSN 的 workersOnTarget>=1 保证） */
-    vector<int> emptyFarms;
-    for (size_t i = 0; i < inf.buildings.size(); ++i) {
-        const tagBuilding& b = inf.buildings[i];
-        if (b.Type != BUILDING_FARM || b.Percent < 100 || b.Cnt <= 0) continue;
-        if (workersOnTarget(inf, b.SN, -1) == 0) emptyFarms.push_back(b.SN);
-    }
 
     for (size_t i = 0; i < inf.farmers.size(); ++i) {
         const tagFarmer& f = inf.farmers[i];
@@ -1332,20 +1058,13 @@ void UsrAI::manageFarmers(const tagInfo& inf)
             continue;
         }
 
-        /* 7) 手空 -> 按角色采集；无目标依次兜底，绝不发呆
-         *    v4.2 问题7：存在0人采集的农田时优先补派（一人一田） */
+        /* 7) 手空 -> 按角色采集；无目标依次兜底，绝不发呆 */
         char role = pickRole(inf);
         s_farmerRole[f.SN] = role;
         int exclude = (quickReturn && lastKind == 'G') ? lastTarget : -1;
         if (exclude > 0) s_targetBadUntil[exclude] = inf.GameFrame + 300;
 
-        int sn = -1;
-        if (!emptyFarms.empty()) {
-            sn = emptyFarms.back();
-            emptyFarms.pop_back();
-            s_farmerRole[f.SN] = 'F';
-        }
-        if (sn < 0) sn = resourceForRole(inf, f.DR, f.UR, role, f.SN);
+        int sn = resourceForRole(inf, f.DR, f.UR, role, f.SN);
         if (sn < 0 && role != 'W') {                 // 本职无目标 -> 伐木
             sn = resourceForRole(inf, f.DR, f.UR, 'W', f.SN);
             if (sn >= 0) s_farmerRole[f.SN] = 'W';
@@ -1412,44 +1131,6 @@ bool UsrAI::priestMoveTo(const tagInfo& inf, const tagArmy* p,
     return true;
 }
 
-/* v4.3 问题2：在箭塔周围找一个可达的空地作为躲避点。
- * 箭塔是2x2建筑，其中心点位于建筑体内部——内核的移动指令不做路径
- * 可达性校验（Core_List.cpp:225 只记录目的地即返回成功），部分地图的
- * 寻路无法停在建筑体内，祭司就会"指令成功但原地不动"。
- * 因此躲避目标必须是塔旁的空地。orient 用于卡住后换方位重试。 */
-static bool towerSideSpot(const tagInfo& inf, const tagBuilding& tw,
-                          int orient, int& odr, int& our_)
-{
-    /* 塔(2x2)周围8个方位的候选块（相对塔左上角） */
-    static const int offs[][2] = {
-        { 2,  0}, {-1,  0}, { 0,  2}, { 0, -1},
-        { 2,  2}, {-1,  2}, { 2, -1}, {-1, -1}
-    };
-    for (int i = 0; i < 8; ++i) {
-        int idx = (orient + i) % 8;
-        int dr = tw.BlockDR + offs[idx][0];
-        int ur = tw.BlockUR + offs[idx][1];
-        /* 移动目标只需该块已探索且非海洋/未知地形即可，
-         * 不用建造预检（那会要求周围3x3全探索，过严） */
-        if (!isExplored(inf, dr, ur)) continue;
-        if (inf.theMap) {
-            const tagTerrain& t = (*inf.theMap)[dr][ur];
-            if (t.height < 0 || t.type == MAPPATTERN_OCEAN) continue;
-        }
-        /* 与所有建筑不重叠 */
-        bool free = true;
-        for (size_t j = 0; j < inf.buildings.size() && free; ++j) {
-            const tagBuilding& b = inf.buildings[j];
-            int bw = bsize(b.Type);
-            if (dr < b.BlockDR + bw && b.BlockDR < dr + 1 &&
-                ur < b.BlockUR + bw && b.BlockUR < ur + 1)
-                free = false;
-        }
-        if (free) { odr = dr; our_ = ur; return true; }
-    }
-    return false;
-}
-
 void UsrAI::managePriest(const tagInfo& inf)
 {
     const tagArmy* p = findPriest(inf);
@@ -1468,83 +1149,6 @@ void UsrAI::managePriest(const tagInfo& inf)
 
     const tagArmy* en = nearestEnemy(inf, p->DR, p->UR);
     double dEn = en ? sqrt(dist2(p->DR, p->UR, en->DR, en->UR)) : 1e18;
-
-    /* v4.2 掉血检测：60帧内掉过血 = 正被攻击 */
-    if (s_lastPriestBlood >= 0 && p->Blood < s_lastPriestBlood)
-        s_priestHurtFrame = inf.GameFrame;
-    s_lastPriestBlood = p->Blood;
-    bool hurtNow = (inf.GameFrame - s_priestHurtFrame < 60);
-
-    /* v4.3 问题2：庇护期（二/三波窗口 或 敌近身）且未躲塔下 ->
-     * 回"塔旁空地"保命（不再指向塔体中心）。
-     * 内核移动指令不做可达性校验，故用位移快照检测卡位：
-     * 下令300帧后位移<0.8格 -> 换方位重试；连续3次失败 ->
-     * 放弃躲塔，降级为原地转化+远离敌人撤离，保证始终有行为输出 */
-    const tagBuilding* twNear = nearestBuilding(inf, BUILDING_ARROWTOWER,
-                                                p->DR, p->UR, true);
-    if (!twNear) twNear = nearestBuilding(inf, BUILDING_CENTER,
-                                          p->DR, p->UR, true);
-    bool underTower = twNear &&
-        dist2(p->DR, p->UR, blockCenter(twNear->BlockDR),
-              blockCenter(twNear->BlockUR)) < 3.5 * s_bls * (3.5 * s_bls);
-    bool needShelter = inShelterWindow(inf.GameFrame) ||
-                       (en && dEn < 20.0 * s_bls);
-    if (underTower) s_shelterTries = 0;     // 已到塔下，失败计数清零
-    if (needShelter && !underTower) {
-        /* 降级分支：连续3次躲塔失败 -> 不再强求回塔 */
-        if (s_shelterTries >= 3) {
-            /* a) 射程内有敌且冷却完毕 -> 原地转换（自保+得分） */
-            if (en && p->ConvertCooldown == 0 && dEn < 9.0 * s_bls &&
-                inf.GameFrame - s_priestSkillFrame >= 40 &&
-                p->NowState == HUMAN_STATE_IDLE) {
-                HumanAction(p->SN, en->SN);
-                s_priestSkillFrame = inf.GameFrame;
-                return;
-            }
-            /* b) 否则向远离敌人的已探索空点撤离 */
-            if (en && p->NowState == HUMAN_STATE_IDLE &&
-                inf.GameFrame - s_priestCmdFrame >= 90) {
-                double ddr = p->DR - en->DR, dur = p->UR - en->UR;
-                double len = sqrt(ddr * ddr + dur * dur);
-                if (len < 1e-6) { ddr = 1.0; dur = 0.0; len = 1.0; }
-                double tx = p->DR + ddr / len * 8.0 * s_bls;
-                double ty = p->UR + dur / len * 8.0 * s_bls;
-                clampDetail(tx, ty);
-                HumanMove(p->SN, tx, ty);
-                s_priestCmdFrame = inf.GameFrame;
-                s_priestCmdId = -1;
-                s_priestMoveKey = -1;
-            }
-            return;
-        }
-        /* 正常分支：去塔旁空地 */
-        if (twNear && p->NowState == HUMAN_STATE_IDLE &&
-            inf.GameFrame - s_priestCmdFrame >= 30) {
-            int sdr = -1, sur = -1;
-            if (towerSideSpot(inf, *twNear, s_shelterTries, sdr, sur)) {
-                HumanMove(p->SN, blockCenter(sdr), blockCenter(sur));
-                s_priestCmdFrame = inf.GameFrame;
-                s_priestCmdId = -1;
-                s_priestMoveKey = -1;
-                /* 记录快照，用于下一轮的卡位检测 */
-                s_shelterSnapDR = p->DR;
-                s_shelterSnapUR = p->UR;
-                s_shelterMoveFrame = inf.GameFrame;
-            }
-        }
-        /* 卡位检测：上次下令300帧后仍几乎没动 -> 计一次失败换方位 */
-        if (s_shelterMoveFrame > 0 &&
-            inf.GameFrame - s_shelterMoveFrame >= 300) {
-            double lim = 0.8 * s_bls;
-            if (dist2(p->DR, p->UR, s_shelterSnapDR, s_shelterSnapUR) <
-                lim * lim) {
-                ++s_shelterTries;
-            }
-            s_shelterMoveFrame = 0;   // 本轮检测结束
-        }
-        return;
-    }
-    if (!needShelter) s_shelterTries = 0;   // 非庇护期复位失败计数
 
     /* 1) 低血且敌军贴脸：逃向最近已建成箭塔 */
     if (en && dEn < 4.0 * s_bls && p->Blood * 100 < p->MaxBlood * 45) {
@@ -1570,23 +1174,19 @@ void UsrAI::managePriest(const tagInfo& inf)
         return;
     }
 
-    /* 2) 转换敌军：冷却完毕且9格内有敌军
-     *    v4.2 问题9：祭司被攻击时优先转换打他的敌人——
-     *    内核未暴露攻击者字段，攻击者必为最近之敌，故用 nearestEnemy
-     *    等价实现；受伤时允许打断治疗出手 */
+    /* 2) 转换敌军：冷却完毕且9格内有敌军（紧急时打断治疗） */
     if (en && p->ConvertCooldown == 0 && dEn < 9.0 * s_bls &&
         inf.GameFrame - s_priestSkillFrame >= 40 &&
         (p->NowState == HUMAN_STATE_IDLE ||
-         (p->NowState == HUMAN_STATE_WORKING &&
-          (hurtNow || dEn < 5.0 * s_bls)))) {
-        HumanAction(p->SN, en->SN);   // 最近敌 = 攻击者优先
+         (p->NowState == HUMAN_STATE_WORKING && dEn < 5.0 * s_bls))) {
+        HumanAction(p->SN, en->SN);
         s_priestSkillFrame = inf.GameFrame;
         return;
     }
 
     /* 3) 治疗友军：12格内血量比例最低且<70%的友方单位
-     *    （v4.1：92%会把祭司钉在家里；v4.2：庇护期跳过治疗防锁定） */
-    if (!needShelter && p->NowState == HUMAN_STATE_IDLE &&
+     *    （v4.1：92%会把祭司钉在家里反复治疗轻伤单位） */
+    if (p->NowState == HUMAN_STATE_IDLE &&
         inf.GameFrame - s_priestSkillFrame >= 40) {
         int healSN = -1;
         double worst = 0.70;
